@@ -118,3 +118,26 @@ A showcase of apps and games built with this plugin:
 ## License
 
 The Dart plugin is covered by the MIT license. For information about the underlying SoLoud engine license, see the [documentation](https://docs.page/alnitak/flutter_soloud/get_started/license).
+
+
+## Fork note: `flutterflow-static-5.2.0`
+
+This branch forks upstream `v5.2.0` for use inside a FlutterFlow project,
+which generates its own `Podfile` and `pubspec.yaml` and exposes neither for
+editing. Two upstream assumptions do not hold there. First, the iOS plugin
+expects to be built as a dynamic framework, so that the engine-lifecycle
+exports it calls can be resolved at load time via `-undefined dynamic_lookup`;
+FlutterFlow's Podfile uses `use_frameworks! :linkage => :static`, as
+FlutterFire requires, which defers those references to the application link
+and fails it. `FlutterSoloudPlugin.mm` therefore resolves the three entry
+points with `dlsym(RTLD_DEFAULT, ...)` and caches the pointers, contributing no
+undefined symbols to any binary and degrading to a `FlutterError` rather than a
+crash if the code asset is somehow absent — which also avoids pushing
+flat-namespace symbol tolerance onto the whole app binary, where chained
+fixups would bind it at launch. Second, the Xiph build defaults to downloading
+prebuilt libraries from GitHub Releases on every clean build, configured only
+through `hooks:` user-defines in the app's `pubspec.yaml`; since that file is
+unreachable, `no_xiph_libs` now defaults to `true` (this app plays WAV only,
+which SoLoud decodes natively) and the prebuild tag is pinned to `v1.0.2`
+instead of `latest` for the case where Xiph is re-enabled. Rebase both changes
+onto each new upstream tag.

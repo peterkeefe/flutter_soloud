@@ -55,7 +55,16 @@ void main(List<String> args) async {
       return null;
     }
 
-    final noXiph = parseBool(input.userDefines['no_xiph_libs']) ?? false;
+    // Default flipped from false. FlutterFlow generates pubspec.yaml and does
+    // not expose it for editing, so `hooks:` user-defines are unreachable and
+    // the default is the only way to choose. With Xiph off the hook takes
+    // XiphLink.empty() and skips forPrebuild() entirely, so no archive is
+    // downloaded from GitHub Releases at build time — removing a hard
+    // dependency on alnitak/flutter_soloud_prebuilds being reachable on every
+    // clean CI build (an HTTP 500 there failed our Android build) and
+    // shrinking the binary. WAV and MP3 use SoLoud's built-in decoders and are
+    // unaffected; OGG/Vorbis/Opus/FLAC are lost. This app plays WAV only.
+    final noXiph = parseBool(input.userDefines['no_xiph_libs']) ?? true;
 
     final bool useSystemLibs;
     final bool forceBuildLibs;
@@ -607,7 +616,11 @@ final class XiphLink {
   }
 
   static const String _prebuildRepo = 'alnitak/flutter_soloud_prebuilds';
-  static const String _defaultPrebuildTag = 'latest';
+  // Pinned rather than 'latest': /releases/latest/download resolves to
+  // whatever is newest at build time, so its content can change without a
+  // package version bump, and an outage on that endpoint fails the build.
+  // v1.0.2 (19 Sep 2026) is what 'latest' resolved to when v5.2.0 shipped.
+  static const String _defaultPrebuildTag = 'v1.0.2';
   static const String _prebuildVersionFileName =
       'flutter_soloud_prebuild_version.txt';
 

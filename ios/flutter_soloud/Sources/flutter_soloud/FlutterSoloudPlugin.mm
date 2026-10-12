@@ -1,6 +1,82 @@
 #import "FlutterSoloudPlugin.h"
 
-#include "engine_lifecycle.h"
+#include <dlfcn.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+// ── Engine-lifecycle entry points, resolved at runtime ───────────────────────
+//
+// These three functions live in the native code asset that hook/build.dart
+// builds and bundles as a dynamic library. They are looked up with dlsym()
+// rather than called directly, so this translation unit contributes NO
+// undefined symbols to whatever binary it is linked into.
+//
+// Why not link against them:
+//
+//   • Under `use_frameworks! :linkage => :static` — which FlutterFire
+//     requires, and which FlutterFlow's generated Podfile uses — this pod has
+//     no link step of its own. Direct references are deferred to the
+//     application's link, where the pod's own OTHER_LDFLAGS do not apply, and
+//     fail: "Undefined symbol: _prepareEngineInitForRequest".
+//
+//   • Propagating `-undefined dynamic_lookup` to the application target would
+//     fix the link, but it makes the entire app binary tolerate flat-namespace
+//     undefined symbols. Under chained fixups those bind at LAUNCH, before any
+//     Dart code has run and therefore before the code asset is a loaded image
+//     — trading a build failure for a possible launch crash in every app,
+//     whether or not it ever plays a sound.
+//
+// dlsym() has neither problem: there is nothing to bind, and a failed lookup
+// becomes a FlutterError rather than a dead process.
+//
+// `engine_lifecycle.h` is deliberately NOT included. Its declarations are
+// reproduced as function-pointer typedefs below, so a future direct call
+// cannot silently reintroduce a link-time reference.
+//
+// Signatures mirror src/engine_lifecycle.h exactly.
+typedef bool (*FSPrepareEngineInitForRequest)(int64_t owner_engine_id,
+                                              uint64_t shutdown_epoch);
+typedef bool (*FSClearDartCallbackRegistrationsForEngine)(int64_t engine_id);
+typedef bool (*FSRequestEngineTeardownForEngine)(int64_t engine_id);
+
+static FSPrepareEngineInitForRequest fsPrepareEngineInitForRequest = NULL;
+static FSClearDartCallbackRegistrationsForEngine
+    fsClearDartCallbackRegistrationsForEngine = NULL;
+static FSRequestEngineTeardownForEngine fsRequestEngineTeardownForEngine = NULL;
+
+/// Resolve the three entry points against every image dyld has loaded.
+///
+/// Deliberately NOT dispatch_once: a lookup attempted before Dart has opened
+/// the code asset must stay retryable, not be cached as permanently
+/// unavailable. Only successful pointers are kept.
+///
+/// Called only from the platform thread, like everything else in this file
+/// (see the ivar note in the @implementation), so the unsynchronised statics
+/// need no locking — and adding any would contradict that contract.
+static BOOL FSResolveEngineLifecycle(void) {
+  if (fsPrepareEngineInitForRequest != NULL &&
+      fsClearDartCallbackRegistrationsForEngine != NULL &&
+      fsRequestEngineTeardownForEngine != NULL) {
+    return YES;
+  }
+  // No leading underscore: dlsym() applies the platform's symbol prefix.
+  if (fsPrepareEngineInitForRequest == NULL) {
+    fsPrepareEngineInitForRequest = (FSPrepareEngineInitForRequest)dlsym(
+        RTLD_DEFAULT, "prepareEngineInitForRequest");
+  }
+  if (fsClearDartCallbackRegistrationsForEngine == NULL) {
+    fsClearDartCallbackRegistrationsForEngine =
+        (FSClearDartCallbackRegistrationsForEngine)dlsym(
+            RTLD_DEFAULT, "clearDartCallbackRegistrationsForEngine");
+  }
+  if (fsRequestEngineTeardownForEngine == NULL) {
+    fsRequestEngineTeardownForEngine = (FSRequestEngineTeardownForEngine)dlsym(
+        RTLD_DEFAULT, "requestEngineTeardownForEngine");
+  }
+  return fsPrepareEngineInitForRequest != NULL &&
+         fsClearDartCallbackRegistrationsForEngine != NULL &&
+         fsRequestEngineTeardownForEngine != NULL;
+}
 
 /// The engine-local channel Dart uses to hand this plugin its engine id.
 ///
@@ -101,6 +177,16 @@ static const int64_t kNoEngineId = -1;
   const uint64_t shutdownEpoch =
       (uint64_t)[epochArgument unsignedLongLongValue];
 
+  // Resolve before taking any claim: a refused request must leave the native
+  // state untouched, and an unresolvable one has taken nothing to retire.
+  if (!FSResolveEngineLifecycle()) {
+    result([FlutterError
+        errorWithCode:@"engine_lifecycle_unavailable"
+              message:@"The flutter_soloud native code asset is not loaded."
+              details:nil]);
+    return;
+  }
+
   // Claimed here, before the reply, so the claim exists before Dart dispatches
   // the initialization. Opening the audio device takes a while, and an engine
   // deallocated during that window must still have something to tear down;
@@ -110,7 +196,7 @@ static const int64_t kNoEngineId = -1;
   // while Dart is suspended waiting for the reply, and a claim landing after
   // that teardown would lower the shutdown flag and record ownership for an
   // engine that is already gone.
-  if (!prepareEngineInitForRequest(engineId, shutdownEpoch)) {
+  if (!fsPrepareEngineInitForRequest(engineId, shutdownEpoch)) {
     result([FlutterError
         errorWithCode:@"stale_prepare"
               message:@"This initialization was superseded by a shutdown."
@@ -132,7 +218,7 @@ static const int64_t kNoEngineId = -1;
   //
   // After the claim rather than before: a refused claim must leave everything
   // untouched, including a newer engine's callables.
-  clearDartCallbackRegistrationsForEngine(engineId);
+  fsClearDartCallbackRegistrationsForEngine(engineId);
 
   result(@(YES));
 }
@@ -162,7 +248,12 @@ static const int64_t kNoEngineId = -1;
   // teardown itself is refused because another engine now owns the native
   // engine — and only then decides whether this engine may dispose it. One
   // call covers both; a separate retirement here would be redundant.
-  requestEngineTeardownForEngine(engineId);
+  // Unreachable with a NULL pointer in practice: _hasEngineId is only YES
+  // after a claim succeeded, which required these to resolve. Guarded anyway
+  // — this runs inside FlutterEngine's dealloc and must never crash.
+  if (FSResolveEngineLifecycle()) {
+    fsRequestEngineTeardownForEngine(engineId);
+  }
 }
 
 @end
