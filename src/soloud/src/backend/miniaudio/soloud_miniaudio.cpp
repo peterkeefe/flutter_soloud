@@ -761,17 +761,24 @@ namespace SoLoud
 
 #if defined(MA_APPLE_MOBILE)
     // On iOS, when an app is suspended by the system, iOS sends an
-    // AVAudioSessionInterruptionNotification with type Began and reason
-    // AVAudioSessionInterruptionReasonAppWasSuspended. Apple explicitly documents
-    // that the system does NOT send an interruption ended notification when the
-    // app returns to the foreground. Without intervention, mInterruptionActive
-    // in Player remains true forever, leaving all subsequent playback silent (#573).
+    // AVAudioSessionInterruptionNotification with type Began but does NOT send
+    // a matching interruption ended notification when the app returns to the
+    // foreground. Without intervention, mInterruptionActive in Player remains
+    // true forever, leaving all subsequent playback silent (#573).
     //
-    // We observe AVAudioSessionInterruptionNotification to track when an
-    // interruption was caused specifically by app suspension, and observe
-    // UIApplicationDidBecomeActiveNotification to synthesize the missing
-    // interruption_ended event when the app returns to the foreground.
-    static std::atomic<bool> gInterruptionWasSuspended{false};
+    // The original fix latched only on reason
+    // AVAudioSessionInterruptionReasonAppWasSuspended, but Apple removed that
+    // reason code in iOS 16 ("the wasSuspended reason is no longer present
+    // from iOS 16"): a suspension now arrives as reason Default, so the latch
+    // never set and interruption_ended was never synthesized.
+    //
+    // So we no longer inspect the reason at all. Any Began latches
+    // gInterruptionPending, and any interruption still pending when
+    // UIApplicationDidBecomeActiveNotification arrives is treated as ended,
+    // because iOS does not reliably deliver Ended for an interruption that
+    // spanned a suspension. A genuine Ended delivered while the app is in the
+    // foreground clears the latch as before, so it is not double-reported.
+    static std::atomic<bool> gInterruptionPending{false};
     static id gAppDidBecomeActiveObserver = nil;
     static id gAudioSessionInterruptionObserver = nil;
 
@@ -794,27 +801,11 @@ namespace SoLoud
 
                 if ([typeNum unsignedIntegerValue] == AVAudioSessionInterruptionTypeBegan)
                 {
-                    NSNumber *reasonNum = nil;
-                    if (@available(iOS 14.5, *)) {
-                        reasonNum = userInfo[AVAudioSessionInterruptionReasonKey];
-                    }
-                    if (reasonNum == nil) {
-                        reasonNum = userInfo[@"AVAudioSessionInterruptionWasSuspendedKey"];
-                    }
-                    bool wasSuspended = false;
-                    if (reasonNum != nil) {
-                        if (@available(iOS 14.5, *)) {
-                            wasSuspended = ([reasonNum unsignedIntegerValue] ==
-                                            AVAudioSessionInterruptionReasonAppWasSuspended);
-                        } else {
-                            wasSuspended = [reasonNum boolValue];
-                        }
-                    }
-                    gInterruptionWasSuspended.store(wasSuspended, std::memory_order_release);
+                    gInterruptionPending.store(true, std::memory_order_release);
                 }
                 else if ([typeNum unsignedIntegerValue] == AVAudioSessionInterruptionTypeEnded)
                 {
-                    gInterruptionWasSuspended.store(false, std::memory_order_release);
+                    gInterruptionPending.store(false, std::memory_order_release);
                 }
             }];
 
@@ -823,16 +814,16 @@ namespace SoLoud
             object:nil
             queue:[NSOperationQueue mainQueue]
             usingBlock:^(NSNotification * _Nonnull note) {
-                // If an interruption was triggered by app suspension, synthesize
-                // the missing interruption_ended notification now that the app
-                // is active in the foreground again.
-                if (gInterruptionWasSuspended.exchange(false, std::memory_order_acq_rel))
+                // If an interruption is still pending, synthesize the missing
+                // interruption_ended notification now that the app is active in
+                // the foreground again.
+                if (gInterruptionPending.exchange(false, std::memory_order_acq_rel))
                 {
                     if (!gDeviceInitialized.load(std::memory_order_acquire) ||
                         gSoloud.load(std::memory_order_acquire) == nullptr)
                         return;
 
-                    soloud_platform_log("miniaudio: synthesizing interruption_ended after app suspension\n");
+                    soloud_platform_log("miniaudio: synthesizing interruption_ended on app activation\n");
                     ma_device_notification notification = {};
                     notification.pDevice = &gDevice;
                     notification.type = ma_device_notification_type_interruption_ended;
@@ -854,7 +845,7 @@ namespace SoLoud
             [center removeObserver:gAppDidBecomeActiveObserver];
             gAppDidBecomeActiveObserver = nil;
         }
-        gInterruptionWasSuspended.store(false, std::memory_order_release);
+        gInterruptionPending.store(false, std::memory_order_release);
     }
 #endif
 
